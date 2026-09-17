@@ -13,12 +13,43 @@ A small macOS disk cleaner with a cached, expandable file tree. Written in Go wi
 ## Requirements
 
 - **macOS** — currently uses macOS filesystem APIs; Linux and Windows are not supported.
-- **Go 1.26.2 or newer** and Git.
+- **Homebrew** for the easiest installation, or download a prebuilt binary.
+- **Go 1.26.2 or newer** and Git only if building from source.
 - An interactive terminal at least **45 columns × 18 rows**. No special font is needed.
 
-Tested on Apple Silicon. Intel Macs can build from source, but have not been tested.
+Apple Silicon is tested locally. Intel downloads are cross-compiled and have not been tested on Intel hardware.
 
-## Quick start
+## Install with Homebrew
+
+```sh
+brew tap jacobslunga/sweep https://github.com/jacobslunga/sweep
+brew install jacobslunga/sweep/sweep
+sweep
+```
+
+This uses the project's custom tap, not Homebrew's main catalog. If your Homebrew version requests trust, approve this formula. Updates are installed with:
+
+```sh
+brew update
+brew upgrade jacobslunga/sweep/sweep
+```
+
+## Download a binary
+
+Download an archive and `checksums.txt` from the [latest release](https://github.com/jacobslunga/sweep/releases/latest): `darwin_arm64` is for Apple Silicon; `darwin_amd64` is for Intel. No Go installation is needed.
+
+For example, for Apple Silicon v0.3.1, from the folder containing the downloaded files:
+
+```sh
+shasum -a 256 --ignore-missing -c checksums.txt
+tar -xzf sweep_0.3.1_darwin_arm64.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 755 sweep "$HOME/.local/bin/sweep"
+```
+
+Verify the matching archive reports **OK** before extracting it. The binaries are not Apple Developer ID signed or notarized; macOS may ask you to approve direct downloads. See the PATH instructions below if `sweep` is not found.
+
+## Run from source
 
 Clone the repository and run directly from source:
 
@@ -163,3 +194,7 @@ Tests use disposable fixtures, covering filesystem validation, symlinks, cancell
 ## Contributing
 
 Open an issue or pull request with a description of the problem and how to reproduce it. For behavior changes, include a test using temporary files and run the checks above. Please keep the interface focused on browsing and cleaning files.
+
+## Releases
+
+See [Publishing Sweep](docs/RELEASING.md) for the versioning, packaging, tagging, and Homebrew update process.
