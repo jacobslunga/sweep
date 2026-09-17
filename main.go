@@ -13,7 +13,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.3.0"
+const version = "0.3.1"
 
 func main() {
 	elevate := flag.Bool("sudo", false, "Run with administrator permissions (sudo prompts in this terminal)")

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"charm.land/bubbles/v2/spinner"
@@ -22,7 +23,15 @@ type scanMsg struct {
 	snapshot
 	ID int
 }
+type diskMsg struct{ Total, Free uint64 }
+type diskTickMsg struct{}
+
+func readDisk(root string) tea.Cmd {
+	return func() tea.Msg { total, free := capacity(root); return diskMsg{total, free} }
+}
+
 type deletedMsg struct {
+	Parents   map[string]os.FileInfo
 	Path      string
 	Size      int64
 	Err       error
@@ -31,6 +40,7 @@ type deletedMsg struct {
 type shutdownMsg struct{}
 
 type model struct {
+	diskTotal, diskFree                     uint64
 	deleteFn                                func(context.Context, entry, snapshot, string) error
 	jobs                                    map[string]bool
 	workers                                 sync.WaitGroup
@@ -68,7 +78,7 @@ func newModel(root, home string) *model {
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(m.beginScan(), m.spin.Tick, tea.RequestBackgroundColor)
+	return tea.Batch(m.beginScan(), m.spin.Tick, tea.RequestBackgroundColor, readDisk(m.root))
 }
 
 func (m *model) beginScan() tea.Cmd {
@@ -90,18 +100,34 @@ func (m *model) index() {
 		}
 	}
 	for p := range m.children {
-		sort.Slice(m.children[p], func(i, j int) bool {
-			a, b := m.children[p][i], m.children[p][j]
-			if m.sortMode == 1 && !a.Info.ModTime().Equal(b.Info.ModTime()) {
-				return a.Info.ModTime().After(b.Info.ModTime())
-			}
-			if m.sortMode != 2 && a.Size != b.Size {
-				return a.Size > b.Size
-			}
-			return a.Path < b.Path
-		})
+		m.sortChildren(p)
 	}
 	m.rebuild()
+}
+func (m *model) sortChildren(p string) {
+	sort.Slice(m.children[p], func(i, j int) bool {
+		a, b := m.children[p][i], m.children[p][j]
+		if m.sortMode == 1 && !a.Info.ModTime().Equal(b.Info.ModTime()) {
+			return a.Info.ModTime().After(b.Info.ModTime())
+		}
+		if m.sortMode != 2 && a.Size != b.Size {
+			return a.Size > b.Size
+		}
+		return a.Path < b.Path
+	})
+}
+
+// Visit only the affected subtree, using the existing adjacency index.
+func (m *model) subtree(path string) []entry {
+	root, ok := m.data.Entries[path]
+	if !ok {
+		return nil
+	}
+	result := []entry{root}
+	for i := 0; i < len(result); i++ {
+		result = append(result, m.children[result[i].Path]...)
+	}
+	return result
 }
 
 func (m *model) rebuild() {
@@ -167,10 +193,8 @@ func (m *model) startDelete() tea.Cmd {
 	e, home := m.pending, m.home
 	// Workers own an immutable snapshot, never the live UI map.
 	s := snapshot{Root: m.data.Root, Entries: map[string]entry{}, Cancelled: m.data.Cancelled}
-	for p, item := range m.data.Entries {
-		if within(e.Path, p) {
-			s.Entries[p] = item
-		}
+	for _, item := range m.subtree(e.Path) {
+		s.Entries[item.Path] = item
 	}
 	m.mode = ""
 	m.updateCache(deletedMsg{Path: e.Path}, false)
@@ -183,13 +207,21 @@ func (m *model) startDelete() tea.Cmd {
 	go func() {
 		defer m.workers.Done()
 		err := deleteFn(context.Background(), e, s, home)
-		result := deletedMsg{Path: e.Path, Size: e.Size, Err: err}
+		result := deletedMsg{Path: e.Path, Size: e.Size, Err: err, Parents: map[string]os.FileInfo{}}
 		if err != nil {
 			fresh := scan(context.Background(), e.Path)
 			result.Remaining = &fresh
 			m.failureMu.Lock()
 			m.failures = append(m.failures, e.Path+": "+err.Error())
 			m.failureMu.Unlock()
+		}
+		for p := filepath.Dir(e.Path); within(s.Root, p); p = filepath.Dir(p) {
+			if info, err := os.Lstat(p); err == nil {
+				result.Parents[p] = info
+			}
+			if p == s.Root {
+				break
+			}
 		}
 		resultCh <- result
 	}()
@@ -211,16 +243,28 @@ func (m *model) requestQuit() tea.Cmd {
 // refresh; deleting a file never triggers another scan of the root.
 func (m *model) updateCache(v deletedMsg, finished bool) {
 	oldSize := m.data.Entries[v.Path].Size
-	for p := range m.data.Entries {
-		if within(v.Path, p) {
-			delete(m.data.Entries, p)
-			delete(m.expanded, p)
+	for _, item := range m.subtree(v.Path) {
+		delete(m.data.Entries, item.Path)
+		delete(m.children, item.Path)
+		delete(m.expanded, item.Path)
+	}
+	parent := filepath.Dir(v.Path)
+	siblings := m.children[parent]
+	for i, item := range siblings {
+		if item.Path == v.Path {
+			m.children[parent] = append(siblings[:i], siblings[i+1:]...)
+			break
 		}
 	}
+	touched := map[string]bool{parent: true}
+
 	newSize := int64(0)
 	if v.Remaining != nil {
 		for p, e := range v.Remaining.Entries {
 			m.data.Entries[p] = e
+			parent := filepath.Dir(p)
+			m.children[parent] = append(m.children[parent], e)
+			touched[parent] = true
 		}
 		newSize = v.Remaining.Entries[v.Path].Size
 	}
@@ -228,17 +272,28 @@ func (m *model) updateCache(v deletedMsg, finished bool) {
 		if e, ok := m.data.Entries[p]; ok {
 			e.Size = max(0, e.Size-oldSize+newSize)
 			if finished {
-				if info, err := os.Lstat(p); err == nil {
+				if info, ok := v.Parents[p]; ok && info.ModTime().After(e.Info.ModTime()) {
 					e.Info = info
 				}
 			}
 			m.data.Entries[p] = e
+			parent := filepath.Dir(p)
+			for i, item := range m.children[parent] {
+				if item.Path == p {
+					m.children[parent][i] = e
+					break
+				}
+			}
+			touched[parent] = true
 		}
 		if p == m.root {
 			break
 		}
 	}
-	m.index()
+	for p := range touched {
+		m.sortChildren(p)
+	}
+	m.rebuild()
 }
 
 func (m *model) applyDeletion(v deletedMsg) {
@@ -258,6 +313,11 @@ func (m *model) applyDeletion(v deletedMsg) {
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := msg.(type) {
+	case diskTickMsg:
+		return m, readDisk(m.root)
+	case diskMsg:
+		m.diskTotal, m.diskFree = v.Total, v.Free
+		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return diskTickMsg{} })
 	case shutdownMsg:
 		return m, m.requestQuit()
 	case tea.WindowSizeMsg:
@@ -562,7 +622,7 @@ func (m *model) View() tea.View {
 	}
 	a := lipgloss.NewStyle().Foreground(accent).Bold(true)
 	dim := lipgloss.NewStyle().Foreground(muted)
-	total, free := capacity(m.root)
+	total, free := m.diskTotal, m.diskFree
 	system := "macOS / " + runtime.GOARCH
 	if os.Geteuid() == 0 {
 		system += " · administrator"
